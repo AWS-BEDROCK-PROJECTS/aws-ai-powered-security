@@ -1,0 +1,280 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Module 3 - Network Isolation (Updated for Module 6)
+  Workshop: AI-Powered Defense-in-Depth for Serverless Application
+  Depends on: workshop-starter-app (UPDATE_COMPLETE), workshop-module2 (CREATE_COMPLETE)
+  Deploys: VPC, two private subnets across two AZs, Lambda security group,
+  route tables, and a DynamoDB Gateway VPC endpoint.
+  Module 6 update: DynamoDB Gateway VPC endpoint policy widened to allow
+  access to all workshop-prefixed DynamoDB tables, supporting the new
+  workshop-orders-protected table deployed by the workshop-module6 stack.
+
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: workshop
+    AllowedPattern: '[a-z0-9\-]+'
+    Description: Environment name prefix for all resources.
+
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: >
+      CIDR block for the VPC.
+      Provides up to 65,536 private IP addresses.
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: >
+      CIDR block for private subnet 1.
+      Deployed in the first Availability Zone.
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: '10.0.2.0/24'
+    Description: >
+      CIDR block for private subnet 2.
+      Deployed in the second Availability Zone.
+
+Resources:
+
+  # ============================================================
+  # VPC
+  # Logically isolated virtual network for the workshop.
+  # EnableDnsHostnames and EnableDnsSupport are both required
+  # for VPC endpoints to resolve service hostnames correctly
+  # through the VPC's internal DNS resolver.
+  # ============================================================
+  WorkshopVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpc'
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # PRIVATE SUBNETS
+  # Two subnets in separate Availability Zones for Lambda
+  # function placement. Multi-AZ placement provides resilience
+  # if one AZ becomes unavailable.
+  #
+  # MapPublicIpOnLaunch: false — resources launched in these
+  # subnets do not receive public IP addresses. Lambda functions
+  # placed here have no direct internet access.
+  # ============================================================
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WorkshopVPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-subnet-1'
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WorkshopVPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-subnet-2'
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # ROUTE TABLES
+  # Each private subnet requires its own route table.
+  # The route tables are associated with the DynamoDB Gateway
+  # VPC endpoint so that DynamoDB-destined traffic from Lambda
+  # functions is routed through the private AWS network.
+  # No internet gateway route is added — these subnets are
+  # intentionally isolated from the public internet.
+  # ============================================================
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WorkshopVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-rt-1'
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WorkshopVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-rt-2'
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  # ============================================================
+  # SECURITY GROUP — Lambda Functions
+  # Acts as a virtual firewall for the Lambda function ENIs.
+  #
+  # Inbound rules: none — Lambda functions are invoked through
+  # the Lambda service API, not through direct network
+  # connections. No inbound network traffic is required.
+  #
+  # Outbound rules: HTTPS (443) only — covers all DynamoDB API
+  # calls routed through the Gateway VPC endpoint. Scoped to
+  # HTTPS only following the principle of least privilege at
+  # the network layer.
+  #
+  # GroupDescription is immutable after creation — it cannot
+  # be updated without replacing the security group.
+  # ============================================================
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-lambda-sg'
+      GroupDescription: 'Security group for workshop Lambda functions in VPC. Outbound HTTPS only.'
+      VpcId: !Ref WorkshopVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow HTTPS outbound for DynamoDB VPC endpoint and AWS service API calls.'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-lambda-sg'
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # DYNAMODB GATEWAY VPC ENDPOINT
+  # Routes all DynamoDB traffic from Lambda functions through
+  # the AWS private network — no internet gateway, NAT device,
+  # or VPN connection required.
+  #
+  # VpcEndpointType: Gateway — Gateway endpoints are free.
+  # There is no hourly charge and no data processing charge
+  # for traffic through a Gateway endpoint. Note: Gateway
+  # endpoints are scoped to same-VPC, same-Region access.
+  # For cross-Region, on-premises, or transit gateway
+  # scenarios, use an Interface endpoint (AWS PrivateLink).
+  #
+  # RouteTableIds — both private route tables are associated
+  # so that DynamoDB-destined traffic from both subnets is
+  # routed through the endpoint.
+  #
+  # PolicyDocument — MODULE 6 UPDATE: The endpoint policy is
+  # scoped to all DynamoDB tables prefixed with the environment
+  # name (workshop-*) in this account and region. This allows
+  # the Lambda functions to access both the original
+  # workshop-orders table and the new workshop-orders-protected
+  # table deployed by the workshop-module6 stack. The original
+  # Module 3 policy referenced only the workshop-orders table
+  # ARN via ImportValue — that policy would block access to the
+  # new protected table because the DynamoDB Gateway VPC
+  # endpoint policy acts as an additional authorization layer
+  # that is evaluated independently of IAM policies.
+  # ============================================================
+  DynamoDBVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref WorkshopVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable1
+        - !Ref PrivateRouteTable2
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowWorkshopTableAccess
+            Effect: Allow
+            Principal: '*'
+            Action: 'dynamodb:*'
+            Resource:
+              - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${EnvironmentName}-*'
+              - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${EnvironmentName}-*/index/*'
+
+Outputs:
+
+  VPCId:
+    Description: Workshop VPC ID.
+    Value: !Ref WorkshopVPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
+
+  PrivateSubnet1Id:
+    Description: >
+      Private subnet 1 ID (first AZ).
+      Used in workshop-starter-app-module3.yaml to attach
+      Lambda functions to the VPC.
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1Id'
+
+  PrivateSubnet2Id:
+    Description: >
+      Private subnet 2 ID (second AZ).
+      Used in workshop-starter-app-module3.yaml to attach
+      Lambda functions to the VPC.
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2Id'
+
+  LambdaSecurityGroupId:
+    Description: >
+      Security group ID for Lambda functions.
+      Used in workshop-starter-app-module3.yaml to attach
+      Lambda functions to the VPC.
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaSecurityGroupId'
+
+  DynamoDBEndpointId:
+    Description: DynamoDB Gateway VPC endpoint ID.
+    Value: !Ref DynamoDBVPCEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBEndpointId'
+
+  PrivateRouteTable1Id:
+    Description: Route table ID for private subnet 1.
+    Value: !Ref PrivateRouteTable1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateRouteTable1Id'
+
+  PrivateRouteTable2Id:
+    Description: Route table ID for private subnet 2.
+    Value: !Ref PrivateRouteTable2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateRouteTable2Id'

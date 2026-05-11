@@ -1,0 +1,465 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Workshop Starter App - Updated for Module 4: Compute Security.
+  Fixes the log injection vulnerability in workshop-create-order by sanitizing
+  user input before logging. Removes the hardcoded SECRET_KEY environment
+  variable placeholder. Tightens the Lambda execution role to least-privilege
+  permissions (GetItem and PutItem only).
+  All other resources are unchanged from the Module 3 deployment.
+  Depends on: workshop-module1 (UserPoolArn), workshop-module3 (subnet and
+  security group IDs)
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: workshop
+    Description: Environment name prefix for all resources.
+
+Resources:
+
+  # ============================================================
+  # DATA LAYER — DynamoDB
+  # Unchanged from Module 3 deployment.
+  # ============================================================
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${EnvironmentName}-orders'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      Tags:
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # IAM — Lambda Execution Role
+  # MODULE 4 CHANGE: DynamoDB permissions tightened to least
+  # privilege. Only GetItem and PutItem are retained — these are
+  # the only operations the functions actually use. DeleteItem,
+  # UpdateItem, Query, and Scan have been removed.
+  # All other role configuration is unchanged from Module 3.
+  # ============================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt OrdersTable.Arn
+      Tags:
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # COMPUTE — Lambda Functions
+  # MODULE 4 CHANGES to CreateOrderFunction:
+  # 1. Log injection fixed — customerId is sanitized by stripping
+  #    newline and carriage return characters before logging.
+  # 2. SECRET_KEY environment variable removed entirely.
+  #    Module 5 will migrate the secret to AWS Secrets Manager.
+  # GetOrderFunction and HealthCheckFunction are unchanged.
+  # ============================================================
+
+  CreateOrderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-create-order'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue 'workshop-module3-PrivateSubnet1Id'
+          - !ImportValue 'workshop-module3-PrivateSubnet2Id'
+        SecurityGroupIds:
+          - !ImportValue 'workshop-module3-LambdaSecurityGroupId'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime, timezone
+
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event, context):
+              table = dynamodb.Table(os.environ['TABLE_NAME'])
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  order_id = str(uuid.uuid4())
+                  # Sanitize customerId to prevent log injection
+                  safe_customer_id = str(body.get('customerId', 'anonymous')).replace('\n', ' ').replace('\r', ' ')
+                  print(f"Creating order for customer: {safe_customer_id}")
+                  item = {
+                      'orderId': order_id,
+                      'status': 'PENDING',
+                      'createdAt': datetime.now(timezone.utc).isoformat(),
+                      'items': body.get('items', []),
+                      'customerId': body.get('customerId', 'anonymous')
+                  }
+                  table.put_item(Item=item)
+                  return {
+                      'statusCode': 201,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'orderId': order_id, 'status': 'PENDING'})
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+      Tags:
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  GetOrderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-get-order'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue 'workshop-module3-PrivateSubnet1Id'
+          - !ImportValue 'workshop-module3-PrivateSubnet2Id'
+        SecurityGroupIds:
+          - !ImportValue 'workshop-module3-LambdaSecurityGroupId'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return int(obj) if obj % 1 == 0 else float(obj)
+                  return super(DecimalEncoder, self).default(obj)
+
+          def lambda_handler(event, context):
+              table = dynamodb.Table(os.environ['TABLE_NAME'])
+              try:
+                  order_id = event['pathParameters']['orderId']
+                  response = table.get_item(Key={'orderId': order_id})
+                  order = response.get('Item')
+                  if not order:
+                      return {
+                          'statusCode': 404,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({'error': 'Order not found'})
+                      }
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps(order, cls=DecimalEncoder)
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+      Tags:
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  HealthCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-health-check'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue 'workshop-module3-PrivateSubnet1Id'
+          - !ImportValue 'workshop-module3-PrivateSubnet2Id'
+        SecurityGroupIds:
+          - !ImportValue 'workshop-module3-LambdaSecurityGroupId'
+      Code:
+        ZipFile: |
+          import json
+
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({'status': 'healthy'})
+              }
+      Tags:
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # API GATEWAY — REST API
+  # Unchanged from Module 3 deployment.
+  # ============================================================
+  OrderAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${EnvironmentName}-order-api'
+      Description: Workshop Order API.
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  OrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OrderAPI
+      ParentId: !GetAtt OrderAPI.RootResourceId
+      PathPart: orders
+
+  OrderIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OrderAPI
+      ParentId: !Ref OrdersResource
+      PathPart: '{orderId}'
+
+  HealthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OrderAPI
+      ParentId: !GetAtt OrderAPI.RootResourceId
+      PathPart: health
+
+  # Cognito Authorizer — unchanged from Module 2 deployment.
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub '${EnvironmentName}-cognito-authorizer'
+      RestApiId: !Ref OrderAPI
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - Fn::ImportValue: 'workshop-module1-UserPoolArn'
+      AuthorizerResultTtlInSeconds: 300
+
+  # Methods — unchanged from Module 2 deployment.
+  CreateOrderMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OrderAPI
+      ResourceId: !Ref OrdersResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations'
+          - FunctionArn: !GetAtt CreateOrderFunction.Arn
+
+  GetOrderMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OrderAPI
+      ResourceId: !Ref OrderIdResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations'
+          - FunctionArn: !GetAtt GetOrderFunction.Arn
+
+  HealthCheckMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OrderAPI
+      ResourceId: !Ref HealthResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations'
+          - FunctionArn: !GetAtt HealthCheckFunction.Arn
+
+  # Lambda Permissions — unchanged from Module 2 deployment.
+  CreateOrderPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CreateOrderFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${OrderAPI}/*/POST/orders'
+
+  GetOrderPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt GetOrderFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${OrderAPI}/*/GET/orders/*'
+
+  HealthCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt HealthCheckFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${OrderAPI}/*/GET/health'
+
+  # Deployment and Stage — unchanged from Module 3 deployment.
+  APIDeploymentV2:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CreateOrderMethod
+      - GetOrderMethod
+      - HealthCheckMethod
+      - CognitoAuthorizer
+    Properties:
+      RestApiId: !Ref OrderAPI
+      Description: 'Module 2 - Cognito authorizer and throttling activated.'
+
+  APIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref OrderAPI
+      DeploymentId: !Ref APIDeploymentV2
+      StageName: prod
+      Description: >
+        Module 4 - Log injection fixed, hardcoded secret removed, IAM role
+        tightened to least privilege. Lambda functions remain in private VPC
+        subnets. Cognito authorizer active. WAF Web ACL association added by
+        workshop-module2 stack.
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingRateLimit: 10
+          ThrottlingBurstLimit: 20
+      Tags:
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+Outputs:
+
+  APIEndpoint:
+    Description: Base URL for the Order API.
+    Value: !Sub 'https://${OrderAPI}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: !Sub '${AWS::StackName}-APIEndpoint'
+
+  APIId:
+    Description: API Gateway REST API ID.
+    Value: !Ref OrderAPI
+    Export:
+      Name: !Sub '${AWS::StackName}-APIId'
+
+  APIStage:
+    Description: API Gateway stage name.
+    Value: prod
+    Export:
+      Name: !Sub '${AWS::StackName}-APIStage'
+
+  OrdersTableName:
+    Description: DynamoDB Orders table name.
+    Value: !Ref OrdersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTableName'
+
+  OrdersTableArn:
+    Description: DynamoDB Orders table ARN.
+    Value: !GetAtt OrdersTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTableArn'
+
+  CreateOrderFunctionArn:
+    Description: ARN of the Create Order Lambda function.
+    Value: !GetAtt CreateOrderFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CreateOrderFunctionArn'
+
+  GetOrderFunctionArn:
+    Description: ARN of the Get Order Lambda function.
+    Value: !GetAtt GetOrderFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GetOrderFunctionArn'
+
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution IAM role.
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  OrdersResourceId:
+    Description: API Gateway /orders resource ID.
+    Value: !Ref OrdersResource
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersResourceId'
+
+  OrderIdResourceId:
+    Description: API Gateway /orders/{orderId} resource ID.
+    Value: !Ref OrderIdResource
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderIdResourceId'
+
+  HealthResourceId:
+    Description: API Gateway /health resource ID.
+    Value: !Ref HealthResource
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthResourceId'
+
+  HealthCheckFunctionArn:
+    Description: ARN of the Health Check Lambda function.
+    Value: !GetAtt HealthCheckFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthCheckFunctionArn'
+
+  CognitoAuthorizerId:
+    Description: ID of the Cognito authorizer.
+    Value: !Ref CognitoAuthorizer
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoAuthorizerId'

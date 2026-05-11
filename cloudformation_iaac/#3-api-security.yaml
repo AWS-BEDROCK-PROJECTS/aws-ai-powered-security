@@ -1,0 +1,319 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Module 2 - API Security + Edge Protection
+  Workshop: AI-Powered Defense-in-Depth for Serverless Application
+  Depends on: workshop-starter-app (UPDATE_COMPLETE), workshop-module1
+  Deploys: WAF Web ACL with four AWS Managed Rule Groups, WAF association
+  with API Gateway prod stage, S3 WAF log bucket, CloudWatch alarm.
+  Note: Cognito authorizer, API methods, deployment, and stage throttling
+  are managed by the workshop-starter-app stack - not this stack.
+
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: workshop
+    AllowedPattern: '[a-z0-9\-]+'
+    Description: >
+      Environment name used for resource naming.
+      Must match the EnvironmentName value used in previous stacks.
+
+  RateLimit:
+    Type: Number
+    Default: 100
+    MinValue: 10
+    MaxValue: 20000000
+    Description: >
+      Maximum number of requests allowed from a single IP address
+      in any 5-minute window before the rate-based rule blocks the IP.
+      AWS WAF minimum value is 10.
+
+
+Resources:
+
+  # ============================================================
+  # S3 BUCKET FOR WAF LOGS
+  # Bucket name MUST start with "aws-waf-logs-" — this naming
+  # convention is required by AWS WAF for log delivery to S3.
+  # 30-day lifecycle policy keeps costs minimal for the workshop.
+  # ============================================================
+  WAFLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub 'aws-waf-logs-${EnvironmentName}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogsAfter30Days
+            Status: Enabled
+            ExpirationInDays: 30
+
+  WAFLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WAFLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowWAFLogDelivery
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${WAFLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowWAFLogDeliveryAclCheck
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt WAFLogsBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ============================================================
+  # WAF IP SET
+  # Used for the IP blocking hands-on exercise in this module.
+  # Participants add their own IP to observe real HTTP 403
+  # blocking behavior against live API traffic.
+  # Initially empty — addresses are added during the exercise.
+  # ============================================================
+  WorkshopBlockedIPSet:
+    Type: AWS::WAFv2::IPSet
+    Properties:
+      Name: !Sub '${EnvironmentName}-blocked-ips'
+      Scope: REGIONAL
+      IPAddressVersion: IPV4
+      Addresses: []
+      Description: 'IP set for manual IP blocking exercises in Module 2.'
+
+  # ============================================================
+  # WAF WEB ACL
+  # A web ACL defines a collection of rules to inspect and
+  # control web requests. Each rule has a statement and an
+  # action. The default action (Allow) applies to any request
+  # that does not match any rule — the rules handle all
+  # blocking decisions.
+  #
+  # Rule evaluation order (ascending priority — lower number
+  # is evaluated first):
+  # Priority 0 — BlockListedIPs (manual IP block list)
+  # Priority 1 — AWSManagedIPReputationList
+  # Priority 2 — AWSManagedCoreRuleSet (OWASP Top 10)
+  # Priority 3 — AWSManagedKnownBadInputs
+  # Priority 4 — RateLimitPerIP (HTTP flood protection)
+  # ============================================================
+  WorkshopWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${EnvironmentName}-webacl'
+      Scope: REGIONAL
+      Description: 'Workshop Web ACL for Module 2 edge protection.'
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${EnvironmentName}WebACL'
+      Rules:
+
+        # Priority 0 — Manual IP block list
+        # Evaluated first so explicitly blocked IPs are stopped
+        # before any managed rule processing occurs.
+        - Name: BlockListedIPs
+          Priority: 0
+          Statement:
+            IPSetReferenceStatement:
+              Arn: !GetAtt WorkshopBlockedIPSet.Arn
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: BlockListedIPs
+
+        # Priority 1 — Amazon IP Reputation List
+        # Blocks IPs identified by Amazon threat intelligence
+        # as associated with bots and known malicious actors.
+        - Name: AWSManagedIPReputationList
+          Priority: 1
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedIPReputationList
+
+        # Priority 2 — Core Rule Set (CRS)
+        # Covers common web exploits including those described
+        # in OWASP Top 10 publications such as SQL injection
+        # and cross-site scripting.
+        - Name: AWSManagedCoreRuleSet
+          Priority: 2
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedCoreRuleSet
+
+        # Priority 3 — Known Bad Inputs
+        # Blocks patterns associated with SSRF, Log4J, and
+        # Java deserialization attacks.
+        - Name: AWSManagedKnownBadInputs
+          Priority: 3
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedKnownBadInputs
+
+        # Priority 4 — Rate-based rule
+        # Blocks IPs exceeding the request threshold in any
+        # 5-minute window. AWS WAF minimum rate limit is 10.
+        - Name: RateLimitPerIP
+          Priority: 4
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimit
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIP
+
+  # ============================================================
+  # WAF LOGGING CONFIGURATION
+  # Sends BLOCK action logs to S3 for analysis.
+  # DefaultBehavior: DROP means only logs matching the filter
+  # (BLOCK actions) are kept — all other logs are dropped.
+  # DependsOn WAFLogsBucketPolicy ensures the bucket policy
+  # allowing WAF log delivery exists before logging is enabled.
+  # ============================================================
+  WAFLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    DependsOn: WAFLogsBucketPolicy
+    Properties:
+      ResourceArn: !GetAtt WorkshopWebACL.Arn
+      LogDestinationConfigs:
+        - !GetAtt WAFLogsBucket.Arn
+      LoggingFilter:
+        DefaultBehavior: DROP
+        Filters:
+          - Behavior: KEEP
+            Requirement: MEETS_ANY
+            Conditions:
+              - ActionCondition:
+                  Action: BLOCK
+
+  # ============================================================
+  # WAF WEB ACL ASSOCIATION WITH API GATEWAY STAGE
+  # This is the critical resource that activates WAF protection
+  # against real API traffic. Without this association, the WAF
+  # Web ACL rules have no effect on API requests.
+  # The ResourceArn format for API Gateway REST API stages is:
+  # arn:aws:apigateway:{region}::/restapis/{apiId}/stages/{stageName}
+  # ============================================================
+  WAFWebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Sub
+        - 'arn:aws:apigateway:${AWS::Region}::/restapis/${APIId}/stages/prod'
+        - APIId: !ImportValue workshop-starter-app-APIId
+      WebACLArn: !GetAtt WorkshopWebACL.Arn
+
+  # ============================================================
+  # CLOUDWATCH ALARM — Blocked Requests
+  # Triggers when WAF blocks more than 10 requests in a
+  # 5-minute period against the live API endpoint.
+  # Provides visibility into blocking activity after the
+  # WAF association is active.
+  # ============================================================
+  BlockedRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-WAF-BlockedRequests'
+      AlarmDescription: >
+        Triggers when WAF blocks more than 10 requests in a
+        5-minute period against the live API Gateway endpoint.
+      Namespace: AWS/WAFV2
+      MetricName: BlockedRequests
+      Dimensions:
+        - Name: WebACL
+          Value: !Sub '${EnvironmentName}-webacl'
+        - Name: Region
+          Value: !Ref AWS::Region
+        - Name: Rule
+          Value: ALL
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+
+  WebACLArn:
+    Description: ARN of the WAF Web ACL associated with API Gateway.
+    Value: !GetAtt WorkshopWebACL.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACLArn'
+
+  WebACLId:
+    Description: ID of the WAF Web ACL.
+    Value: !GetAtt WorkshopWebACL.Id
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACLId'
+
+  BlockedIPSetId:
+    Description: >
+      ID of the IP Set for manual blocking exercises.
+      Used in the IP block list exercise in this module.
+    Value: !GetAtt WorkshopBlockedIPSet.Id
+    Export:
+      Name: !Sub '${AWS::StackName}-BlockedIPSetId'
+
+  BlockedIPSetArn:
+    Description: ARN of the IP Set for manual blocking exercises.
+    Value: !GetAtt WorkshopBlockedIPSet.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BlockedIPSetArn'
+
+  WAFLogsBucketName:
+    Description: S3 bucket where WAF BLOCK action logs are stored.
+    Value: !Ref WAFLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-WAFLogsBucketName'

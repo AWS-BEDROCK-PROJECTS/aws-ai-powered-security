@@ -1,0 +1,253 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Module 6 - Data Protection with Customer-Managed KMS Encryption
+  Workshop: AI-Powered Defense-in-Depth for Serverless Application
+  Depends on: workshop-starter-app (UPDATE_COMPLETE from Module 5),
+  workshop-module3 (VPC, subnets, security group, route tables)
+  Deploys: Customer-managed KMS key with automatic rotation for DynamoDB
+  encryption, new DynamoDB table (workshop-orders-protected) encrypted with
+  the customer-managed key, with Point-in-Time Recovery and DynamoDB Streams
+  (NEW_AND_OLD_IMAGES) enabled. KMS Interface VPC endpoint for private
+  network access from Lambda functions to the KMS service.
+  After deploying this stack, update the workshop-starter-app stack using
+  workshop-starter-app-module6.yaml to point the Lambda functions to the
+  new protected table and add KMS permissions.
+
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: workshop
+    AllowedPattern: '[a-z0-9\-]+'
+    Description: >
+      Environment name used for resource naming.
+      Must match the EnvironmentName value used in previous stacks.
+
+Resources:
+
+  # ============================================================
+  # KMS KEY FOR DYNAMODB ENCRYPTION
+  # Customer-managed key replaces the default AWS-owned key
+  # used by the original workshop-orders table, providing full
+  # control over key policy, rotation, and audit trail.
+  #
+  # EnableKeyRotation: true — AWS KMS automatically rotates
+  # the key material annually. Previous key versions are
+  # retained for decryption of older ciphertext.
+  #
+  # Key policy grants:
+  # - Root account: full key management via IAM policies
+  # - DynamoDB service: encrypt/decrypt for table data
+  #   storage and retrieval
+  # - Lambda execution role: decrypt and generate data keys
+  #   for reading from and writing to the encrypted table
+  # ============================================================
+  DynamoDBKMSKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub 'Customer-managed KMS key for ${EnvironmentName} DynamoDB encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowDynamoDBServiceUse
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !ImportValue 'workshop-starter-app-LambdaExecutionRoleArn'
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+
+  DynamoDBKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${EnvironmentName}-dynamodb-key'
+      TargetKeyId: !Ref DynamoDBKMSKey
+
+  # ============================================================
+  # PROTECTED DYNAMODB TABLE
+  # DynamoDB does not support changing the encryption key on an
+  # existing table in-place. This new table is created with the
+  # customer-managed KMS key configured from the start.
+  #
+  # SSESpecification:
+  # - SSEEnabled: true — enables server-side encryption
+  # - SSEType: KMS — uses AWS KMS (not the default AES256
+  #   which maps to the AWS-owned key)
+  # - KMSMasterKeyId — references the customer-managed key
+  #
+  # StreamSpecification:
+  # - StreamViewType: NEW_AND_OLD_IMAGES — captures both the
+  #   old and new images of each modified item for audit
+  #   logging and change data capture
+  #
+  # The table uses the same orderId partition key as the
+  # original table, so Lambda function code does not need
+  # any changes to the data access pattern.
+  # ============================================================
+  OrdersTableProtected:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${EnvironmentName}-orders-protected'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DynamoDBKMSKey
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # SECURITY GROUP — KMS VPC Endpoint
+  # Interface VPC endpoint ENIs need to accept inbound HTTPS
+  # connections from the Lambda functions. This dedicated
+  # security group allows inbound HTTPS (443) from the Lambda
+  # security group only.
+  # ============================================================
+  KMSEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-kms-endpoint-sg'
+      GroupDescription: 'Security group for KMS VPC endpoint. Allows inbound HTTPS from Lambda security group.'
+      VpcId: !ImportValue 'workshop-module3-VPCId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !ImportValue 'workshop-module3-LambdaSecurityGroupId'
+          Description: 'Allow HTTPS inbound from Lambda functions.'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-kms-endpoint-sg'
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # KMS INTERFACE VPC ENDPOINT
+  # Lambda functions in private subnets need a network path to
+  # the KMS service to perform kms:GenerateDataKey and
+  # kms:Decrypt operations when writing to and reading from the
+  # KMS-encrypted DynamoDB table. Without this endpoint, KMS
+  # API calls from the Lambda functions time out because there
+  # is no internet path from the private subnets.
+  #
+  # Interface VPC endpoints create ENIs in the specified subnets
+  # and use private DNS to resolve the KMS service hostname
+  # (kms.{region}.amazonaws.com) to private IP addresses within
+  # the VPC. With PrivateDnsEnabled: true, the boto3 client
+  # resolves the KMS endpoint automatically — no code changes
+  # required.
+  #
+  # The endpoint uses a dedicated security group that allows
+  # inbound HTTPS from the Lambda security group. This is
+  # required because the Lambda security group has no inbound
+  # rules — it only allows outbound HTTPS. The endpoint ENIs
+  # need to accept the inbound connections that the Lambda
+  # functions initiate.
+  #
+  # Unlike Gateway endpoints, Interface endpoints incur an
+  # hourly charge per AZ plus data processing charges.
+  # ============================================================
+  KMSVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !ImportValue 'workshop-module3-VPCId'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.kms'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !ImportValue 'workshop-module3-PrivateSubnet1Id'
+        - !ImportValue 'workshop-module3-PrivateSubnet2Id'
+      SecurityGroupIds:
+        - !Ref KMSEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-kms-endpoint'
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+Outputs:
+
+  DynamoDBKMSKeyArn:
+    Description: >
+      ARN of the customer-managed KMS key for DynamoDB encryption.
+      Used in the workshop-starter-app-module6.yaml update to scope
+      the Lambda execution role kms:Decrypt and kms:GenerateDataKey
+      permissions.
+    Value: !GetAtt DynamoDBKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBKMSKeyArn'
+
+  DynamoDBKMSKeyId:
+    Description: ID of the customer-managed KMS key for DynamoDB encryption.
+    Value: !Ref DynamoDBKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBKMSKeyId'
+
+  OrdersTableProtectedName:
+    Description: >
+      Name of the protected DynamoDB table.
+      Used in the workshop-starter-app-module6.yaml update as the
+      TABLE_NAME environment variable for the Lambda functions.
+    Value: !Ref OrdersTableProtected
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTableProtectedName'
+
+  OrdersTableProtectedArn:
+    Description: >
+      ARN of the protected DynamoDB table.
+      Used in the workshop-starter-app-module6.yaml update to scope
+      the Lambda execution role DynamoDB permissions.
+    Value: !GetAtt OrdersTableProtected.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTableProtectedArn'
+
+  OrdersTableStreamArn:
+    Description: >
+      ARN of the DynamoDB Stream on the protected table.
+      Available for downstream consumers such as Lambda triggers
+      for audit logging or change data capture processing.
+    Value: !GetAtt OrdersTableProtected.StreamArn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTableStreamArn'
+
+  KMSVPCEndpointId:
+    Description: KMS Interface VPC endpoint ID.
+    Value: !Ref KMSVPCEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSVPCEndpointId'

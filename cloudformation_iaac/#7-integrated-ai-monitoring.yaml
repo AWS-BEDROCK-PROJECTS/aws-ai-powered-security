@@ -1,0 +1,409 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Capstone - AI-Powered Monitoring and Automated Incident Response
+  Workshop: AI-Powered Defense-in-Depth for Serverless Application
+  Depends on: All previous stacks healthy.
+  Deploys: Amazon GuardDuty detector, SNS topic with email subscription,
+  incident response Lambda function with Amazon Bedrock integration (Amazon Nova 2 Lite),
+  EventBridge rule for high-severity findings, CloudWatch log group.
+  The incident response Lambda function runs outside the VPC — it only
+  calls AWS service APIs (Bedrock, SNS, IAM, GuardDuty) that are
+  accessible over the public AWS network.
+
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: workshop
+    AllowedPattern: '[a-z0-9\-]+'
+    Description: >
+      Environment name used for resource naming.
+      Must match the EnvironmentName value used in previous stacks.
+
+  NotificationEmail:
+    Type: String
+    Description: >
+      Email address for security alert notifications.
+      After stack creation, you must confirm the SNS subscription
+      by clicking the confirmation link in the email sent by AWS SNS.
+
+Resources:
+
+  # ============================================================
+  # AMAZON GUARDDUTY DETECTOR
+  # Enables intelligent threat detection across VPC Flow Logs,
+  # CloudTrail management events, DNS query logs, and optionally
+  # Lambda network activity, S3 data events, and RDS login events.
+  #
+  # FindingPublishingFrequency: FIFTEEN_MINUTES is the most
+  # frequent publishing interval available. GuardDuty batches
+  # findings and publishes them to EventBridge at this interval.
+  #
+  # Feature flags enable additional data sources:
+  # - LAMBDA_NETWORK_LOGS: monitors outbound connections from
+  #   Lambda functions for communication with known malicious IPs
+  # - S3_DATA_EVENTS: monitors S3 API calls for anomalous access
+  # - RDS_LOGIN_EVENTS: monitors RDS authentication attempts
+  # ============================================================
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      Features:
+        - Name: LAMBDA_NETWORK_LOGS
+          Status: ENABLED
+        - Name: S3_DATA_EVENTS
+          Status: ENABLED
+        - Name: RDS_LOGIN_EVENTS
+          Status: ENABLED
+
+  # ============================================================
+  # SNS TOPIC FOR SECURITY ALERTS
+  # The incident response Lambda function publishes structured
+  # alerts to this topic. The email subscription delivers alerts
+  # to the security team.
+  #
+  # DisplayName appears as the sender name in email notifications.
+  # The subscription requires confirmation — after stack creation,
+  # check your email and click the confirmation link.
+  # ============================================================
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-security-alerts'
+      DisplayName: !Sub '${EnvironmentName} Security Alerts'
+      Tags:
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  SecurityAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SecurityAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ============================================================
+  # CLOUDWATCH LOG GROUP
+  # Dedicated log group for the incident response Lambda function.
+  # 30-day retention keeps costs minimal for the workshop.
+  # Created explicitly to control retention and ensure cleanup
+  # on stack deletion.
+  # ============================================================
+  IncidentResponseLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EnvironmentName}-incident-response'
+      RetentionInDays: 30
+
+  # ============================================================
+  # IAM ROLE — Incident Response Lambda Function
+  # Follows least-privilege principles with separate named
+  # policies for each service. Each policy is scoped to the
+  # minimum required resources.
+  #
+  # This function runs OUTSIDE the VPC. Unlike the order
+  # processing Lambda functions that need VPC access for
+  # DynamoDB and Secrets Manager, the incident response function
+  # only calls AWS service APIs (Bedrock, SNS, IAM, GuardDuty)
+  # that are accessible over the public AWS network. Running
+  # outside the VPC avoids the need for additional Interface
+  # VPC endpoints and reduces cold start latency.
+  #
+  # No AWSLambdaVPCAccessExecutionRole — not needed since the
+  # function does not run in a VPC.
+  # ============================================================
+  IncidentResponseLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-incident-response-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt IncidentResponseLogGroup.Arn
+        - PolicyName: IAMKeyDisable
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:UpdateAccessKey
+                  - iam:ListAccessKeys
+                Resource: '*'
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityAlertsTopic
+        - PolicyName: GuardDutyRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - guardduty:GetFindings
+                  - guardduty:ListFindings
+                Resource: '*'
+        - PolicyName: BedrockInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - 'arn:aws:bedrock:*::foundation-model/amazon.nova-2-lite-v1:0'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-2-lite-v1:0'
+      Tags:
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # INCIDENT RESPONSE LAMBDA FUNCTION
+  # Triggered by EventBridge on HIGH severity GuardDuty findings
+  # (severity >= 7.0). Performs three actions:
+  #
+  # 1. Calls Amazon Bedrock (Amazon Nova 2 Lite) to generate a
+  #    natural language summary of the GuardDuty finding
+  # 2. For findings involving compromised access keys, disables
+  #    the key by calling iam:UpdateAccessKey with Status: Inactive
+  # 3. Publishes a structured alert to the SNS topic containing
+  #    the finding type, severity, title, AI summary, and any
+  #    containment actions taken
+  #
+  # No VpcConfig — this function runs outside the VPC.
+  # ============================================================
+  IncidentResponseFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: IncidentResponseLogGroup
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-incident-response'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt IncidentResponseLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityAlertsTopic
+          ENVIRONMENT: !Ref EnvironmentName
+          BEDROCK_MODEL_ID: 'us.amazon.nova-2-lite-v1:0'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          sns = boto3.client('sns')
+          iam = boto3.client('iam')
+          bedrock = boto3.client(
+              'bedrock-runtime',
+              region_name=os.environ.get('AWS_REGION', 'us-east-1')
+          )
+
+          def handler(event, context):
+              finding = event.get('detail', {})
+              severity = finding.get('severity', 0)
+              finding_type = finding.get('type', 'Unknown')
+              title = finding.get('title', 'Unknown finding')
+
+              logger.info("Processing GuardDuty finding: %s - Severity: %s",
+                          finding_type, severity)
+
+              # Generate AI-powered summary using Amazon Bedrock
+              summary = generate_ai_summary(finding)
+
+              # Automated containment for HIGH severity findings
+              # severity >= 7.0 is HIGH per GuardDuty severity scale
+              containment_actions = []
+              if severity >= 7.0:
+                  resource = finding.get('resource', {})
+                  if resource.get('resourceType') == 'AccessKey':
+                      access_key_details = resource.get('accessKeyDetails', {})
+                      access_key_id = access_key_details.get('accessKeyId')
+                      if access_key_id:
+                          try:
+                              iam.update_access_key(
+                                  AccessKeyId=access_key_id,
+                                  Status='Inactive'
+                              )
+                              logger.info("Disabled compromised access key: %s",
+                                          access_key_id)
+                              containment_actions.append(
+                                  f"Disabled access key: {access_key_id}")
+                          except Exception as e:
+                              logger.error("Could not disable access key: %s", str(e))
+                              containment_actions.append(
+                                  f"Failed to disable access key: {str(e)}")
+
+              # Notify security team via SNS
+              try:
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f'GuardDuty [{severity}]: {finding_type}'[:100],
+                      Message=json.dumps({
+                          'finding_type': finding_type,
+                          'severity': severity,
+                          'title': title,
+                          'ai_summary': summary,
+                          'containment_actions': containment_actions,
+                          'account_id': finding.get('accountId', 'unknown'),
+                          'region': finding.get('region', 'unknown')
+                      }, indent=2)
+                  )
+                  logger.info("SNS notification sent for finding: %s", finding_type)
+              except Exception as e:
+                  logger.error("SNS publish failed: %s", str(e))
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Incident response executed')
+              }
+
+          def generate_ai_summary(finding):
+              try:
+                  finding_type = finding.get('type', 'Unknown')
+                  severity = finding.get('severity', 0)
+                  title = finding.get('title', 'Unknown')
+                  description = finding.get('description', 'No description available')
+
+                  prompt = f"""You are a cloud security analyst. Analyze this AWS GuardDuty \
+          security finding and provide a concise 2-3 sentence summary for a security team \
+          that includes: the threat type, potential impact, and recommended immediate action.
+
+          Finding type: {finding_type}
+          Severity: {severity}
+          Title: {title}
+          Description: {description}
+
+          Provide only the summary, no preamble."""
+
+                  response = bedrock.invoke_model(
+                      modelId=os.environ['BEDROCK_MODEL_ID'],
+                      body=json.dumps({
+                          'messages': [
+                              {
+                                  'role': 'user',
+                                  'content': [{'text': prompt}]
+                              }
+                          ],
+                          'inferenceConfig': {
+                              'maxTokens': 300
+                          }
+                      })
+                  )
+                  result = json.loads(response['body'].read())
+                  return result['output']['message']['content'][0]['text']
+
+              except Exception as e:
+                  logger.error("Bedrock invocation failed: %s", str(e))
+                  return 'AI summary unavailable - review finding details manually'
+      Tags:
+        - Key: Workshop
+          Value: !Ref EnvironmentName
+  # ============================================================
+  # EVENTBRIDGE RULE
+  # Triggers automated incident response on GuardDuty HIGH
+  # severity findings (severity >= 7.0). The numeric comparison
+  # in the event pattern ensures only HIGH and CRITICAL findings
+  # trigger automated response. Lower-severity findings are
+  # still recorded in the GuardDuty console for manual review.
+  # ============================================================
+  GuardDutyHighSeverityRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentName}-guardduty-high-severity'
+      Description: >
+        Triggers automated incident response on GuardDuty
+        HIGH severity findings (severity >= 7.0)
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+        detail:
+          severity:
+            - numeric:
+              - '>='
+              - 7.0
+      State: ENABLED
+      Targets:
+        - Id: IncidentResponseTarget
+          Arn: !GetAtt IncidentResponseFunction.Arn
+
+  # ============================================================
+  # LAMBDA PERMISSION FOR EVENTBRIDGE
+  # Allows EventBridge to invoke the incident response Lambda
+  # function when a matching GuardDuty finding is published.
+  # ============================================================
+  IncidentResponseEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt IncidentResponseFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GuardDutyHighSeverityRule.Arn
+
+Outputs:
+
+  GuardDutyDetectorId:
+    Description: GuardDuty detector ID.
+    Value: !Ref GuardDutyDetector
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardDutyDetectorId'
+
+  SecurityAlertsTopicArn:
+    Description: ARN of the SNS topic for security alerts.
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAlertsTopicArn'
+
+  IncidentResponseFunctionArn:
+    Description: ARN of the incident response Lambda function.
+    Value: !GetAtt IncidentResponseFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IncidentResponseFunctionArn'
+
+  IncidentResponseFunctionName:
+    Description: Name of the incident response Lambda function.
+    Value: !Ref IncidentResponseFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-IncidentResponseFunctionName'
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule for high-severity findings.
+    Value: !GetAtt GuardDutyHighSeverityRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleArn'
+
+  EventBridgeRuleName:
+    Description: Name of the EventBridge rule.
+    Value: !Ref GuardDutyHighSeverityRule
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleName'

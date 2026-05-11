@@ -1,0 +1,248 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Module 1 - Identity Verification with Amazon Cognito
+  Workshop: AI-Powered Defense-in-Depth for Serverless Application
+  Depends on: workshop-starter-app
+
+Parameters:
+
+  Environment:
+    Type: String
+    Default: workshop
+    AllowedPattern: '[a-z0-9\-]+'
+    Description: Environment name used for resource naming.
+
+  StarterAppAPIId:
+    Type: String
+    Description: >
+      API Gateway REST API ID from the workshop-starter-app stack.
+      Used to scope the authenticated user IAM role to your specific API.
+      Retrieve with:
+        aws cloudformation describe-stacks \
+          --stack-name workshop-starter-app \
+          --query 'Stacks[0].Outputs[?OutputKey==`APIId`].OutputValue' \
+          --output text
+
+Resources:
+
+  # ------------------------------------------------------------
+  # Cognito User Pool
+  # Provides a secure user directory with MFA, adaptive
+  # authentication, and compromised credential detection.
+  #
+  # AdvancedSecurityMode: AUDIT logs risk assessments for
+  # sign-in attempts without blocking them. This allows you
+  # to observe risk scoring behavior before enabling ENFORCED
+  # mode. Allowed values: OFF | AUDIT | ENFORCED
+  #
+  # MfaConfiguration: OPTIONAL is the recommended setting for
+  # user pools with adaptive authentication and threat
+  # protection. Cognito generates MFA prompts for users who
+  # have configured a preferred MFA factor, and adaptive
+  # authentication can escalate to require MFA based on
+  # assessed risk without forcing all users to set up MFA.
+  #
+  # Docs: https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-identity-pools.html
+  # ------------------------------------------------------------
+  WorkshopUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${Environment}-user-pool'
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: OPTIONAL
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      EmailVerificationMessage: 'Your verification code is {####}'
+      EmailVerificationSubject: 'Workshop Email Verification'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 1
+      UserPoolAddOns:
+        AdvancedSecurityMode: AUDIT
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+
+  # ------------------------------------------------------------
+  # Cognito User Pool Client
+  # Used by the API to authenticate users and validate JWT
+  # tokens.
+  #
+  # GenerateSecret: false allows the AWS CLI to authenticate
+  # directly using USER_PASSWORD_AUTH without requiring client
+  # secret signing. In production, use ALLOW_USER_SRP_AUTH
+  # from application code for stronger security.
+  #
+  # PreventUserExistenceErrors: ENABLED prevents user
+  # enumeration attacks by returning the same error message
+  # whether or not the user exists.
+  #
+  # Docs: https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-settings-client-apps.html
+  # ------------------------------------------------------------
+  WorkshopUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${Environment}-api-client'
+      UserPoolId: !Ref WorkshopUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # ------------------------------------------------------------
+  # Cognito Identity Pool
+  # Issues temporary, limited-privilege AWS credentials to
+  # authenticated users via AWS STS without exposing long-term
+  # credentials.
+  #
+  # The enhanced authentication flow works as follows:
+  # 1. Application presents a JWT token in a GetId request
+  # 2. Identity pool returns an identity ID
+  # 3. Application combines identity ID with JWT in a
+  #    GetCredentialsForIdentity request
+  # 4. AWS STS returns temporary credentials valid for 1 hour
+  #
+  # AllowUnauthenticatedIdentities: false ensures only
+  # authenticated users receive credentials — unauthenticated
+  # guest access is explicitly disabled.
+  #
+  # Docs: https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-identity.html
+  # ------------------------------------------------------------
+  WorkshopIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub '${Environment}_identity_pool'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref WorkshopUserPoolClient
+          ProviderName: !GetAtt WorkshopUserPool.ProviderName
+          ServerSideTokenCheck: true
+
+  # ------------------------------------------------------------
+  # IAM Role for Authenticated Users
+  # Grants authenticated Cognito users temporary credentials
+  # with minimal permissions scoped to invoke the workshop API.
+  #
+  # Trust policy uses two condition keys:
+  # - cognito-identity.amazonaws.com:aud restricts to users
+  #   from this specific identity pool only
+  # - cognito-identity.amazonaws.com:amr: authenticated
+  #   restricts to authenticated users only
+  #
+  # StarterAppAPIId is passed as a parameter rather than using
+  # Fn::ImportValue to avoid CloudFormation export lock errors
+  # when the workshop-starter-app stack is updated in Module 2.
+  #
+  # Docs: https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles.html
+  # ------------------------------------------------------------
+  AuthenticatedUserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-cognito-authenticated-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                cognito-identity.amazonaws.com:aud: !Ref WorkshopIdentityPool
+              ForAnyValue:StringLike:
+                cognito-identity.amazonaws.com:amr: authenticated
+      Policies:
+        - PolicyName: AuthenticatedUserPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:Invoke
+                Resource: !Sub
+                  - 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIId}/prod/*'
+                  - APIId: !Ref StarterAppAPIId
+
+  # ------------------------------------------------------------
+  # Identity Pool Role Attachment
+  # Associates the IAM role with the Identity Pool so that
+  # authenticated users receive the correct temporary
+  # credentials upon successful authentication.
+  # ------------------------------------------------------------
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref WorkshopIdentityPool
+      Roles:
+        authenticated: !GetAtt AuthenticatedUserRole.Arn
+
+Outputs:
+
+  UserPoolId:
+    Description: >
+      Cognito User Pool ID.
+      Used in Module 2 to create the API Gateway Cognito authorizer.
+    Value: !Ref WorkshopUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolArn:
+    Description: >
+      Cognito User Pool ARN.
+      Imported by the updated workshop-starter-app stack in Module 2
+      to configure the CognitoAuthorizer resource.
+    Value: !GetAtt WorkshopUserPool.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolArn'
+
+  UserPoolClientId:
+    Description: >
+      Cognito User Pool Client ID.
+      Used to authenticate users and obtain JWT tokens for
+      testing the API authorizer in Module 2.
+    Value: !Ref WorkshopUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
+
+  IdentityPoolId:
+    Description: Cognito Identity Pool ID.
+    Value: !Ref WorkshopIdentityPool
+    Export:
+      Name: !Sub '${AWS::StackName}-IdentityPoolId'
+
+  UserPoolProviderURL:
+    Description: >
+      Cognito User Pool Provider URL.
+      Used in Module 2 as the JWT issuer URL for the
+      API Gateway authorizer.
+    Value: !GetAtt WorkshopUserPool.ProviderURL
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolProviderURL'
